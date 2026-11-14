@@ -12,9 +12,9 @@ header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 22px
 h1{font-size:18px;margin:0}
 .badge{padding:3px 12px;border-radius:999px;font-weight:600;font-size:12px;border:1px solid var(--line)}
 .b-IDLE{background:#1f2937;color:#9ca3af}
-.b-PREPARING,.b-RECOVERING,.b-VERIFYING{background:#3b2f0b;color:var(--warn)}
+.b-PREPARING,.b-RECOVERING,.b-VERIFYING,.b-SUSPENDED{background:#3b2f0b;color:var(--warn)}
 .b-READY{background:#052e1b;color:var(--ok)}
-.b-FAILED{background:#3b0d0d;color:var(--bad)}
+.b-FAILED,.b-INVALIDATED{background:#3b0d0d;color:var(--bad)}
 main{max-width:1180px;margin:0 auto;padding:18px;display:grid;gap:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
 .card h2{margin:0 0 10px;font-size:15px;color:#aec2ff}
@@ -93,8 +93,30 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
       <span class="small mut">默认筛选即“误删集”：WX-03 / temperature，可直接核对误删前数据</span>
     </div>
     <div id="rowsBody"></div>
-    <div style="margin-top:12px">
+    <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">
       <button class="danger" onclick="reclaim()">回收当前恢复库（停止实例并删除副本，之后可再次恢复）</button>
+      <button class="ghost" onclick="killInstance()" title="模拟恢复实例意外退出，验证结果开放与实例存活绑定">
+        模拟实例意外退出（演练）
+      </button>
+    </div>
+  </section>
+
+  <section class="card hidden" id="suspendedCard">
+    <h2>④ 结果暂停开放（实例状态待确认）</h2>
+    <div class="errbox" id="suspendedBody"></div>
+    <div class="small mut">副本与恢复占用保留，不会自动重新恢复。确认实例停止后点击“回收副本”，
+      回收成功（确认停止）后才允许重新发起恢复。</div>
+    <div style="margin-top:10px">
+      <button class="danger" onclick="reclaim()">确认并回收副本（停止实例、释放占用）</button>
+    </div>
+  </section>
+
+  <section class="card hidden" id="invalidCard">
+    <h2>④ 当前恢复任务已失效（实例已停止）</h2>
+    <div class="errbox" id="invalidBody"></div>
+    <div class="small mut">旧汇总与明细一律拒绝交付。副本与占用保留，必须回收后才允许重新恢复。</div>
+    <div style="margin-top:10px">
+      <button class="danger" onclick="reclaim()">回收失效副本并重置（之后可重新恢复）</button>
     </div>
   </section>
 
@@ -111,7 +133,9 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const STATE_CN = {IDLE:'空闲',PREPARING:'准备中',RECOVERING:'WAL 重放中',VERIFYING:'校验目标中',READY:'已到达目标 · 结果开放',FAILED:'失败（进程已回收）'};
+const STATE_CN = {IDLE:'空闲',PREPARING:'准备中',RECOVERING:'WAL 重放中',VERIFYING:'校验目标中',
+  READY:'已到达目标 · 结果开放',SUSPENDED:'实例状态待确认 · 结果暂停',
+  INVALIDATED:'实例已停止 · 任务失效',FAILED:'失败（进程已回收）'};
 const STEPS = [
   ['PREPARING','① 复制物理基线备份 / 写入恢复配置'],
   ['RECOVERING','② 启动恢复实例，从 WAL 归档重放'],
@@ -181,22 +205,39 @@ async function pollStatus(){
   badge.textContent = STATE_CN[s.state] || s.state;
   renderPlan();
   renderProgress(s);
-  $('#resultCard').classList.toggle('hidden', s.state !== 'READY');
+  const resultOpen = s.state === 'READY';
+  $('#resultCard').classList.toggle('hidden', !resultOpen);
   $('#failedCard').classList.toggle('hidden', s.state !== 'FAILED');
+  $('#suspendedCard').classList.toggle('hidden', s.state !== 'SUSPENDED');
+  $('#invalidCard').classList.toggle('hidden', s.state !== 'INVALIDATED');
   if(s.state === 'READY') await renderResult();
   if(s.state === 'FAILED') renderFailed(s);
+  if(s.state === 'INVALIDATED') renderInvalid(s);
+  if(s.state === 'SUSPENDED') renderSuspended(s);
+  if(s.state !== 'READY'){
+    filtersInit = false;
+    $('#resultBody').textContent = '';
+    $('#rowsBody').textContent = '';
+  }
 }
 
 function renderProgress(s){
   const order = ['PREPARING','RECOVERING','VERIFYING','READY'];
-  const cur = s.state === 'FAILED' ? (s.run && s.run.error ? failStage(s) : 0) : order.indexOf(s.state);
+  let cur;
+  if(s.state === 'FAILED') cur = (s.run && s.run.error) ? failStage(s) : 0;
+  else if(s.state === 'INVALIDATED' || s.state === 'SUSPENDED') cur = 3;
+  else cur = order.indexOf(s.state);
   $('#steps').innerHTML = s.run ? STEPS.map(([k,label],i) => {
     let cls = '', icon = '○';
-    if(s.state === 'FAILED' && i === cur){ cls = 'err'; icon = '✗'; }
+    if((s.state === 'FAILED' || s.state === 'INVALIDATED') && i === cur){ cls = 'err'; icon = '✗'; }
     else if(i < cur || s.state === 'READY'){ cls = 'done'; icon = '✓'; }
     else if(i === cur){ cls = 'on'; icon = '▶'; }
     return `<div class="step ${cls}">${icon} ${label}</div>`;
   }).join('') : '<div class="mut small">空闲：选择恢复点后点击“启动恢复”。</div>';
+  if(s.state === 'SUSPENDED')
+    $('#steps').innerHTML += '<div class="step on">⏸ 结果暂停开放：暂无法确认实例存活，副本与占用保留</div>';
+  if(s.state === 'INVALIDATED')
+    $('#steps').innerHTML += '<div class="step err">✗ 实例已停止：当前任务失效，旧汇总与明细拒绝交付</div>';
   if(s.run){
     $('#runMeta').innerHTML =
       `任务 <code>${esc(s.run.id)}</code> · 目标恢复点 <code>${esc(s.run.restore_point)}</code>` +
@@ -220,8 +261,22 @@ function failStage(s){
 }
 
 async function renderResult(){
+  if(renderResult.busy) return;
+  renderResult.busy = true;
+  // 结果卡片重绘前先清空，避免历史上一次的成功结果显示在“已失效/暂停”提示旁
+  $('#resultBody').innerHTML = '<div class="mut small">正在确认恢复实例存活并读取汇总…</div>';
   let sum;
-  try{ sum = await api('/api/recovered/summary'); }catch(e){ return; }
+  try{ sum = await api('/api/recovered/summary'); }
+  catch(e){
+    // 汇总被拒绝（实例失效/暂停/查询错误）：清空旧结果并说明原因，绝不继续展示旧数据
+    filtersInit = false;
+    $('#resultBody').innerHTML = '<div class="errbox"><b>汇总未交付：</b>' + esc(e.message) + '</div>';
+    $('#rowsBody').innerHTML = '';
+    renderResult.busy = false;
+    if(e.status === 409) setTimeout(pollStatus, 0);   // 门禁已变化：刷新徽标与卡片
+    return;
+  }
+  renderResult.busy = false;
   const rps = manifest ? manifest.restore_points : [];
   const rowsDef = [
     {label:'遥测总行数', a:rps[0]?.expected_total, b:rps[1]?.expected_total, chk:sum.checks[0]},
@@ -268,8 +323,16 @@ async function queryRows(){
         <table><tr><th>id</th><th>设备</th><th>站点</th><th>指标</th><th>值</th><th>recorded_at</th><th>ingested_at</th></tr>
         ${r.rows.map(x => `<tr><td>${x.id}</td><td>${esc(x.device_id)}</td><td>${esc(x.site)}</td><td>${esc(x.metric)}</td><td>${x.value}</td><td class="small">${esc(x.recorded_at)}</td><td class="small">${esc(x.ingested_at)}</td></tr>`).join('')}</table>`;
   }catch(e){
-    $('#rowsBody').innerHTML = '<div class="bad small">查询被拒绝：' + esc(e.message) + '</div>';
+    // 明细被拒绝：清空可能已过期的行，并显示原因（失效/暂停/单次查询错误区分）
+    const cls = e.status === 503 ? 'warn' : 'bad';
+    $('#rowsBody').innerHTML = `<div class="${cls} small">明细未交付：` + esc(e.message) + '</div>';
+    if(e.status !== 503) pollStatus();
   }
+}
+
+function evidenceHtml(r){
+  const ev = (r.probe_evidence || []);
+  return ev.length ? `<div class="small mut">判定依据：<br/>${ev.map(x => '· ' + esc(x)).join('<br/>')}</div>` : '';
 }
 
 function renderFailed(s){
@@ -278,6 +341,23 @@ function renderFailed(s){
     `<b>失败原因：</b>${esc(r.error || '未知')}<br/>` +
     (r.inject_fault ? `<span class="warn small">本次注入了归档缺段故障（段 ${esc(r.missing_segment)} 缺失），失败符合预期。</span><br/>` : '') +
     `<span class="small mut">任务 ${esc(r.id || '')} · 目标恢复点 ${esc(r.restore_point || '')}</span>`;
+}
+
+function renderInvalid(s){
+  const r = s.run || {};
+  $('#invalidBody').innerHTML =
+    `<b>失效原因：</b>${esc(r.invalid_reason || r.error || '恢复实例已停止')}<br/>` +
+    `<span class="small mut">任务 ${esc(r.id || '')} · 目标恢复点 ${esc(r.restore_point || '')}` +
+    (r.invalidated_at ? ` · 认定于 ${esc(r.invalidated_at)}` : '') + `</span>` +
+    evidenceHtml(r);
+}
+
+function renderSuspended(s){
+  const r = s.run || {};
+  $('#suspendedBody').innerHTML =
+    `<b>暂停原因：</b>暂无法确认恢复实例是否仍存活，结果已暂停开放（旧汇总/明细均不交付）。<br/>` +
+    `<span class="small mut">任务 ${esc(r.id || '')} · 目标恢复点 ${esc(r.restore_point || '')} · 副本与占用保留，不会自动重新恢复。</span>` +
+    evidenceHtml(r);
 }
 
 async function startRecovery(){
@@ -289,17 +369,29 @@ async function startRecovery(){
       body: JSON.stringify({restore_point: sel.value, inject_fault: $('#injectFault').checked}),
     });
     filtersInit = false;
+    $('#resultBody').innerHTML = ''; $('#rowsBody').innerHTML = '';
     pollStatus();
   }catch(e){ alert('启动失败：' + e.message); }
+}
+
+async function killInstance(){
+  if(!confirm('模拟恢复实例意外退出？此后旧汇总与明细将一律拒绝，需回收副本后才能重新恢复。')) return;
+  try{
+    await api('/api/drill/kill-instance', {method:'POST'});
+    $('#resultBody').innerHTML = '';
+    $('#rowsBody').innerHTML = '';
+    filtersInit = false;
+    pollStatus();
+  }catch(e){ alert('模拟退出失败：' + e.message); }
 }
 
 async function reclaim(){
   try{
     await api('/api/reclaim', {method:'POST'});
     filtersInit = false;
-    $('#rowsBody').innerHTML = '';
+    $('#rowsBody').innerHTML = ''; $('#resultBody').innerHTML = '';
     pollStatus();
-  }catch(e){ alert('回收失败：' + e.message); }
+  }catch(e){ alert('回收失败：' + e.message); pollStatus(); }
 }
 
 loadManifest();
